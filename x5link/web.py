@@ -89,6 +89,10 @@ class MjpegSource:
         self.quality, self.pixel_format = quality, pixel_format
         self.dev_name = dev_name              # 按名字重新解析序号用
         self.stall_timeout = float(stall_timeout)
+        #: 按名字找不到相机时的重试间隔。比稳态重试慢得多 —— 相机没插的时候
+        #: 没必要每 3 秒开一次别的设备，那是纯浪费（实测会累积到 1024 次重启）。
+        self.missing_backoff = 5.0
+        self.camera_present: bool | None = None
         self.ffmpeg_log = ffmpeg_log or os.path.join(
             tempfile.gettempdir(), "x5link-ffmpeg.log")
 
@@ -112,8 +116,16 @@ class MjpegSource:
         self.notes.append(f"[{time.strftime('%T')}] {msg}")
         del self.notes[:-20]
 
-    def _resolve_index(self) -> int:
-        """每次起 ffmpeg 前按名字重新问一次序号。问不到就退回上次那个。"""
+    def _resolve_index(self):
+        """每次起 ffmpeg 前按名字重新问一次序号；**找不到就返回 None**。
+
+        这里绝不能"问不到就退回上次那个序号" —— 退回旧序号等于去打开
+        「现在恰好占着那个序号」的设备（通常是内置 FaceTime 摄像头），
+        然后永远打不开 2880x1440、永远没有帧、看门狗无限重启。
+        实测这样会把 restarts 累积到 1024 次，而画面一直不动、日志里只有
+        FaceTime 的模式列表 —— 相机明明不在，程序却在跟另一台相机较劲。
+        相机不在，就该老老实实说"相机不在"。
+        """
         if not self.dev_name:
             return self.index
         try:
@@ -121,7 +133,10 @@ class MjpegSource:
             dev = match_device(self.dev_name)
         except Exception:
             dev = None
-        if dev is not None and dev.index != self.index:
+        if dev is None:
+            self._note(f"找不到「{self.dev_name}」：相机没接 / 没开机 / 不在 webcam 模式")
+            return None
+        if dev.index != self.index:
             self._note(f"设备序号变了：{self.index} -> {dev.index}（{dev.name}），已跟随")
             self.index = dev.index
         return self.index
@@ -150,6 +165,10 @@ class MjpegSource:
 
     # -- ffmpeg 命令 ----------------------------------------------------
     def _cmd(self):
+        # 相机不在就干脆不起 ffmpeg（返回 None），别去打开别的设备。
+        idx = self._resolve_index()
+        if idx is None:
+            return None
         # loglevel 用 warning 而不是 error：真正要排的那两类故障
         # （"Selected video size/pixel format ... not supported"）都是 **warning**，
         # 用 error 级别会被吞掉，于是日志文件是空的、什么都查不到。
@@ -159,7 +178,7 @@ class MjpegSource:
         if self.pixel_format:
             c += ["-pixel_format", self.pixel_format]
         c += ["-video_size", f"{self.width}x{self.height}",
-              "-i", str(self._resolve_index()),
+              "-i", str(idx),
               "-map", "0:v",
               "-vf", f"scale={self.out_w}:{self.out_h}",
               # -r 不能省：avfoundation 报的时基是假的，不锁帧率 ffmpeg 会无限补帧
@@ -173,10 +192,21 @@ class MjpegSource:
         while not self._stop.is_set():
             errf = None
             try:
+                cmd = self._cmd()
+                if cmd is None:
+                    # 相机不在：**不要**去开别的设备，也不要让看门狗空转 ——
+                    # 重新计宽限、歇久一点再看。状态用 note 说清楚。
+                    self.camera_present = False
+                    self.proc = None
+                    self._t0 = self._last_publish = time.time()
+                    if not self._stop.is_set():
+                        time.sleep(self.missing_backoff)
+                    continue
+                self.camera_present = True
                 # stderr 不再丢进 DEVNULL —— 之前"没有任何日志"就是这么来的。
                 # 每次重拉都覆盖写，文件里永远是最近一次尝试的报错。
                 errf = open(self.ffmpeg_log, "wb")
-                self.proc = subprocess.Popen(self._cmd(), stdout=subprocess.PIPE,
+                self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                                              stderr=errf)
                 while not self._stop.is_set():
                     chunk = self.proc.stdout.read(65536)
@@ -342,6 +372,7 @@ def make_handler(src: MjpegSource):
                     # ↓ 采集侧的自述：序号是否变过、看门狗是否动过手。
                     #   出问题先看这两个，别再去猜"为什么画面不动"。
                     "device_index": src.index,
+                    "camera_present": src.camera_present,
                     "restarts": src.restarts,
                     "notes": src.notes[-5:],
                 }, ensure_ascii=False).encode()

@@ -52,6 +52,10 @@ curl -s http://127.0.0.1:8765/status
 | **设备序号会变** | AVFoundation 枚举顺序**不稳定**（实测到过 `[0]=Insta360/[1]=FaceTime`，过一会儿反过来）。序号只解析一次的话，顺序一翻 ffmpeg 就打开错误的设备（FaceTime 不支持 2880×1440），报 `Selected video size is not supported`，然后**永久**不出帧 | 每次起 ffmpeg 前 `_resolve_index()` **按名字重新解析序号** |
 | **ffmpeg 活着但不出帧** | `stdout.read()` **永久阻塞**，循环再也回不到重启逻辑 —— 表现是"服务在跑、状态正常、画面不动" | `_watch` 看门狗：首帧 **12s** / 稳态 **3s** 没有新帧就 kill 掉重来 |
 | **错误全被吞掉** | `stderr=DEVNULL` + `except: pass`，**一行日志都没有**，根本没法查 | ffmpeg 的 stderr 落到日志文件；`-loglevel` 用 **warning** 而不是 error（要排的 `Selected pixel format/size ... not supported` 恰好都是 warning，用 error 会得到 0 字节日志） |
+| **相机不在时退回旧序号** | 按名字找不到相机就退回上次那个序号 → 去打开**现在恰好占着该序号**的设备（通常是内置摄像头）→ 永远打不开 2880x1440、永远没帧、看门狗无限重启。实测把 `restarts` 累积到 **1024** 次，画面一直不动，日志里只有 FaceTime 的模式列表 | `_resolve_index()` 找不到就**返回 None**：干脆不起 ffmpeg，`/status` 报 `camera_present: false` 并说明"相机没接/没开机/不在 webcam 模式"，重试间隔放到 5s（`missing_backoff`） |
+
+> 实测验证（相机不在时）：
+> `_resolve_index() -> None`、`_cmd() -> None`、`camera_present -> False`、`restarts -> 0`。
 
 `/status` 现在还会自述 `device_index` / `restarts` / `notes`（序号是否变过、看门狗何时动的手），
 出问题先看这三个。
