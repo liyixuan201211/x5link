@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleName</key>
+	<string>X5Link</string>
+	<key>CFBundleDisplayName</key>
+	<string>X5Link</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.nankesong.x5link</string>
+	<key>CFBundleExecutable</key>
+	<string>X5Link</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleVersion</key>
+	<string>0.1.0</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1.0</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>11.0</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSCameraUsageDescription</key>
+	<string>X5Link 需要读取 Insta360 X5 的实时画面，用于测量端到端延迟并保存本次游戏素材。</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>X5Link 需要读取相机麦克风，用于同时录制游戏现场声音。</string>
+</dict>
+</plist>

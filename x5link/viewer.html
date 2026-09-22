@@ -1,0 +1,493 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>X5 · 360° 实时预览</title>
+<style>
+  html,body{margin:0;height:100%;overflow:hidden;background:#0b0d10;
+            font:13px/1.5 -apple-system,"PingFang SC","Helvetica Neue",sans-serif;color:#e8eaed}
+  #gl{display:block;width:100vw;height:100vh;cursor:grab;touch-action:none}
+  #gl.dragging{cursor:grabbing}
+  #src{display:none}
+  .panel{position:fixed;background:rgba(14,17,22,.72);backdrop-filter:blur(10px);
+         border:1px solid rgba(255,255,255,.09);border-radius:10px;padding:10px 12px;
+         pointer-events:none;user-select:none}
+  #hud{left:14px;top:14px;min-width:210px}
+  #hud b{font-weight:600;font-size:14px;letter-spacing:.2px}
+  #hud .row{display:flex;justify-content:space-between;gap:16px;opacity:.85}
+  #hud .k{opacity:.55}
+  #hud .hint{margin-top:7px;padding-top:7px;border-top:1px solid rgba(255,255,255,.1);
+             opacity:.6;font-size:12px}
+  #mapWrap{right:14px;top:14px;width:300px}
+  #mapWrap .cap{opacity:.6;font-size:12px;margin-bottom:6px}
+  #map{display:block;width:300px;height:150px;border-radius:5px;background:#000}
+  #badge{position:fixed;left:50%;top:16px;transform:translateX(-50%);
+         background:rgba(200,40,40,.9);padding:6px 14px;border-radius:8px;
+         font-weight:600;display:none}
+  #err{position:fixed;inset:0;display:none;place-content:center;text-align:center;padding:40px;
+       font-size:15px;line-height:1.8}
+</style>
+</head>
+<body>
+<canvas id="gl"></canvas>
+<img id="src" alt="">
+<div id="hud" class="panel">
+  <b>Insta360 X5 · 360° 实时</b>
+  <div class="row"><span class="k">画面</span><span id="vRes">—</span></div>
+  <div class="row"><span class="k">视频帧率</span><span id="vVid">—</span></div>
+  <div class="row"><span class="k">渲染帧率</span><span id="vFps">—</span></div>
+  <div class="row"><span class="k">视角 FOV</span><span id="vFov">—</span></div>
+  <div class="row"><span class="k">朝向</span><span id="vYaw">—</span></div>
+  <div class="hint">拖动看四周 · 滚轮/双指缩放<br>R 复位 · E 原始经纬图 · F 全屏</div>
+</div>
+<div id="mapWrap" class="panel">
+  <div class="cap">原始经纬图（你看的是其中一块，已校正畸变）</div>
+  <canvas id="map" width="600" height="300"></canvas>
+</div>
+<div id="badge">信号中断，重连中…</div>
+<div id="err"></div>
+
+<script>
+"use strict";
+const canvas = document.getElementById('gl');
+const img    = document.getElementById('src');
+const mapCv  = document.getElementById('map');
+const mapCtx = mapCv.getContext('2d');
+
+// ---------------------------------------------------------------- 状态
+let yaw = 0, pitch = 0, fov = 75 * Math.PI / 180;   // fov = 垂直视场角
+const FOV_MIN = 18 * Math.PI / 180, FOV_MAX = 110 * Math.PI / 180;
+let showMap = true, showRaw = false;
+let texW = 0, texH = 0, hasFrame = false;
+let fps = 0, frames = 0, lastFpsT = performance.now();
+let vidFps = 0, vidFrames = 0;   // 视频帧率（真的收到新帧），和渲染帧率分开算
+
+// ---------------------------------------------------------------- WebGL
+const gl = canvas.getContext('webgl2', {antialias:false, alpha:false})
+        || canvas.getContext('webgl',  {antialias:false, alpha:false});
+if (!gl) {
+  const e = document.getElementById('err');
+  e.style.display = 'grid';
+  e.innerHTML = '这个浏览器不支持 WebGL，无法做 360° 校正预览。<br>请换 Chrome / Safari 新版本。';
+  throw new Error('no webgl');
+}
+const isGL2 = typeof WebGL2RenderingContext !== 'undefined' && gl instanceof WebGL2RenderingContext;
+
+const VS = `
+attribute vec2 aPos;
+void main(){ gl_Position = vec4(aPos, 0.0, 1.0); }`;
+
+// 每个像素反推一条视线方向，再用「经纬图 -> 透视」的公式去采样。
+// 这一步就是无畸变的来源：屏幕上每条视线都是直线透视，不是把球面原样摊开。
+const FS = `
+precision highp float;
+uniform sampler2D uTex;
+uniform vec2  uRes;
+uniform float uYaw, uPitch, uFov;
+uniform float uRaw;          // 1 = 直接平铺经纬图（对比用）
+const float PI = 3.141592653589793;
+
+void main(){
+  vec2 p = (gl_FragCoord.xy / uRes) * 2.0 - 1.0;
+  p.x *= uRes.x / uRes.y;
+
+  if (uRaw > 0.5) {                       // 原始经纬图：等距平铺
+    vec2 uv = vec2(gl_FragCoord.x / uRes.x, gl_FragCoord.y / uRes.y);
+    gl_FragColor = texture2D(uTex, uv);
+    return;
+  }
+
+  float f = 1.0 / tan(uFov * 0.5);
+  vec3 d = normalize(vec3(p.x, p.y, -f));  // 相机空间，朝 -Z 看
+
+  float cp = cos(uPitch), sp = sin(uPitch);          // 先俯仰
+  d = vec3(d.x, cp*d.y - sp*d.z, sp*d.y + cp*d.z);
+  float cy = cos(uYaw), sy = sin(uYaw);              // 再偏航
+  d = vec3(cy*d.x + sy*d.z, d.y, -sy*d.x + cy*d.z);
+
+  float lon = atan(d.x, -d.z);                       // -PI..PI
+  float lat = asin(clamp(d.y, -1.0, 1.0));           // -PI/2..PI/2
+  vec2 uv = vec2(lon / (2.0*PI) + 0.5, 0.5 - lat / PI);
+  gl_FragColor = texture2D(uTex, uv);
+}`;
+
+function sh(type, src){
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS))
+    throw new Error(gl.getShaderInfoLog(s));
+  return s;
+}
+const prog = gl.createProgram();
+gl.attachShader(prog, sh(gl.VERTEX_SHADER, VS));
+gl.attachShader(prog, sh(gl.FRAGMENT_SHADER, FS));
+gl.linkProgram(prog);
+if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+gl.useProgram(prog);
+
+const buf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
+const aPos = gl.getAttribLocation(prog, 'aPos');
+gl.enableVertexAttribArray(aPos);
+gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+
+const uTex = gl.getUniformLocation(prog,'uTex');
+const uRes = gl.getUniformLocation(prog,'uRes');
+const uYaw = gl.getUniformLocation(prog,'uYaw');
+const uPitch = gl.getUniformLocation(prog,'uPitch');
+const uFov = gl.getUniformLocation(prog,'uFov');
+const uRaw = gl.getUniformLocation(prog,'uRaw');
+
+const tex = gl.createTexture();
+gl.bindTexture(gl.TEXTURE_2D, tex);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+// 经度方向首尾相接，能循环时就用 REPEAT（省掉接缝）
+const wrap = isGL2 ? gl.REPEAT : gl.CLAMP_TO_EDGE;
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, wrap);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+gl.uniform1i(uTex, 0);
+
+// 小地图底图（原始经纬图）。只在新帧到达时更新一次，
+// 绝不跟渲染同频 —— 否则 120Hz 下光这一项就要吃掉大量主线程时间。
+const mapBase = document.createElement('canvas');
+mapBase.width = 600; mapBase.height = 300;
+const mbCtx = mapBase.getContext('2d');
+
+// ---------------------------------------------------------------- 视频流
+//
+// 关键：JPEG 解码必须放在 Worker 里做。
+// 之前是让 <img> 直接当纹理上传，把这个 <img> 交给 texImage2D / texSubImage2D 时，
+// 只要那一帧还没解码完，浏览器就会**在主线程上同步解码** —— 2880x1440 一张要
+// 20~40ms，30fps 的预算只有 33ms，于是帧率被死死压在 20 上下，而且随着画面
+// 复杂度抖动。实测就是这么掉的：29 → 24 → 18。
+//
+// 现在改成 Worker 里 fetch 这条 MJPEG、自己切帧、createImageBitmap 解码，
+// 只把解好的 ImageBitmap 传回主线程（transferable，零拷贝）。
+// 主线程只做「上传纹理」这一件事，而且拿到的帧一定是解码完成的。
+
+const WORKER_SRC = `
+let stop = false;
+function findSeq(buf, seq, from){
+  outer: for (let i = from; i <= buf.length - seq.length; i++){
+    for (let j = 0; j < seq.length; j++) if (buf[i + j] !== seq[j]) continue outer;
+    return i;
+  }
+  return -1;
+}
+(async () => {
+  // 必须用绝对地址：Blob URL 起的 Worker，base 是那个 blob: 地址，
+  // 相对路径 '/stream.mjpg' 会直接解析失败。
+  const res = await fetch('${location.origin}/stream.mjpg', { cache: 'no-store' });
+  if (!res.body) throw new Error('这个浏览器不支持流式 fetch');
+  const reader = res.body.getReader();
+  let buf = new Uint8Array(0);
+  while (!stop){
+    const { value, done } = await reader.read();
+    if (done) break;
+    if (value && value.length){
+      const merged = new Uint8Array(buf.length + value.length);
+      merged.set(buf); merged.set(value, buf.length);
+      buf = merged;
+    }
+    // 从字节流里切出完整 JPEG：SOI(FFD8) ... EOI(FFD9)
+    for (;;){
+      const s = findSeq(buf, [0xFF, 0xD8], 0);
+      if (s < 0){ buf = buf.slice(Math.max(0, buf.length - 1)); break; }
+      const e = findSeq(buf, [0xFF, 0xD9], s + 2);
+      if (e < 0){ if (s > 0) buf = buf.slice(s); break; }
+      const jpg = buf.slice(s, e + 2);
+      buf = buf.slice(e + 2);
+      try {
+        const bmp = await createImageBitmap(new Blob([jpg], { type: 'image/jpeg' }));
+        postMessage({ t: 'f', bmp }, [bmp]);
+      } catch (_) { /* 偶尔半帧，跳过 */ }
+    }
+  }
+})().catch(e => postMessage({ t: 'err', msg: String(e && e.message || e) }));
+self.onmessage = () => { stop = true; };
+`;
+
+let bmp = null;                 // 最新一帧（已解码）
+let bmpCount = 0, bmpFps = 0, lastBmpT = performance.now();
+let workerAlive = false, gotAnyBmp = false, lastErr = null;
+
+function startWorker(){
+  try {
+    const url = URL.createObjectURL(new Blob([WORKER_SRC], { type: 'text/javascript' }));
+    const w = new Worker(url);
+    workerAlive = true;
+    w.onmessage = (ev) => {
+      if (ev.data.t === 'err'){          // 别把错误吞掉，否则无从查起
+        lastErr = ev.data.msg;
+        document.getElementById('badge').textContent = '解码出错：' + lastErr;
+        document.getElementById('badge').style.display = 'block';
+        return;
+      }
+      if (ev.data.t !== 'f') return;
+      gotAnyBmp = true;
+      bmpCount++;
+      if (bmp) bmp.close();     // 来不及显示的旧帧直接丢，保证低延迟
+      bmp = ev.data.bmp;
+      document.getElementById('badge').style.display = 'none';
+    };
+    w.onerror = (e) => { lastErr = 'worker onerror: ' + (e.message || e); };
+  } catch (e) {
+    workerAlive = false;
+    lastErr = 'Worker 起不来: ' + e;
+  }
+}
+startWorker();
+
+// 回退路径：Worker 不可用时仍然用 <img>（会慢，但至少能看）
+let everConnected = false;
+function connect(){
+  img.src = '/stream.mjpg?t=' + Date.now();
+}
+img.addEventListener('load', () => {
+  everConnected = true;
+  loadSeen++;
+  dirty = true;
+  document.getElementById('badge').style.display = 'none';
+});
+img.addEventListener('error', () => {
+  document.getElementById('badge').style.display = everConnected ? 'block' : 'none';
+  setTimeout(connect, 1200);
+});
+setTimeout(() => { if (!gotAnyBmp && !workerAlive) connect(); }, 800);
+setTimeout(() => { if (!gotAnyBmp) connect(); }, 6000);
+
+// ---------------------------------------------------------------- 交互
+const cv = canvas;
+let dragging = false, lastX = 0, lastY = 0;
+
+// 灵敏度按「转过的角度 = 手移动的比例 × 当前视场角」来算，
+// 也就是拖过整个视口高度正好转过一个 FOV。这样放大缩小时手感一致，
+// 不会出现「轻轻一拖就飞出去」那种失控感。
+function sens(){
+  const aspect = canvas.width / Math.max(1, canvas.height);
+  const fovX = 2 * Math.atan(Math.tan(fov / 2) * aspect);
+  return {
+    x: fovX / Math.max(1, canvas.clientWidth),
+    y: fov  / Math.max(1, canvas.clientHeight),
+  };
+}
+
+cv.addEventListener('pointerdown', e => {
+  dragging = true; lastX = e.clientX; lastY = e.clientY;
+  cv.classList.add('dragging');
+  try { cv.setPointerCapture(e.pointerId); } catch (_) { /* 合成事件没有真实指针，忽略 */ }
+});
+cv.addEventListener('pointermove', e => {
+  if (!dragging) return;
+  const s = sens();
+  // 「抓住画面拖」——业界标准约定（街景 / YouTube 360 / Pannellum / PSV 都是这样）：
+  // 手往哪边动，画面就跟着往哪边走，图片黏在你的鼠标上。
+  // 所以：手向上拖 -> 画面向上移 -> 视线其实是往下转。两个轴都用 +=，
+  // 保证「画面位移方向 == 手移动方向」。
+  yaw   += (e.clientX - lastX) * s.x;
+  pitch += (e.clientY - lastY) * s.y;
+  clampPitch();
+  lastX = e.clientX; lastY = e.clientY;
+});
+function endDrag(e){ dragging = false; cv.classList.remove('dragging'); }
+cv.addEventListener('pointerup', endDrag);
+cv.addEventListener('pointercancel', endDrag);
+
+cv.addEventListener('wheel', e => {
+  e.preventDefault();
+  fov *= Math.exp(e.deltaY * 0.0012);
+  fov = Math.min(FOV_MAX, Math.max(FOV_MIN, fov));
+}, {passive:false});
+
+// 双指捏合
+let pinch = null;
+cv.addEventListener('touchstart', e => {
+  if (e.touches.length === 2) pinch = dist(e.touches);
+}, {passive:true});
+cv.addEventListener('touchmove', e => {
+  if (e.touches.length === 2 && pinch) {
+    const d = dist(e.touches);
+    fov *= pinch / d; pinch = d;
+    fov = Math.min(FOV_MAX, Math.max(FOV_MIN, fov));
+    e.preventDefault();
+  }
+}, {passive:false});
+cv.addEventListener('touchend', () => { pinch = null; });
+function dist(t){ const dx=t[0].clientX-t[1].clientX, dy=t[0].clientY-t[1].clientY;
+                  return Math.hypot(dx,dy); }
+
+function clampPitch(){
+  const lim = Math.PI/2 - 0.01;
+  pitch = Math.min(lim, Math.max(-lim, pitch));
+}
+
+addEventListener('keydown', e => {
+  const k = e.key.toLowerCase();
+  if (k === 'r'){ yaw = 0; pitch = 0; fov = 75*Math.PI/180; }
+  if (k === 'e'){ showRaw = !showRaw; }
+  if (k === 'f'){ document.fullscreenElement ? document.exitFullscreen()
+                                             : document.documentElement.requestFullscreen(); }
+});
+
+// ---------------------------------------------------------------- 渲染
+function resize(){
+  const dpr = Math.min(devicePixelRatio || 1, 2);
+  const w = Math.floor(innerWidth * dpr), h = Math.floor(innerHeight * dpr);
+  if (canvas.width !== w || canvas.height !== h){ canvas.width = w; canvas.height = h; }
+}
+
+// 只有真的来了新帧才上传纹理。
+// MJPEG 的 <img> 每收到一帧会触发一次 load，用它当「有新帧」的信号；
+// 万一某个浏览器不逐帧触发，就退化成按时间限流（约 32Hz）。
+// 这一步是「跟手」的关键：原来每个 rAF 都传一次 1920×960（120Hz 下约 1.8GB/s），
+// 主线程全被拷贝吃掉了，拖动自然一顿一顿的。
+let dirty = false, loadSeen = 0, lastUpload = 0;
+const UPLOAD_FALLBACK_MS = 1000 / 32;
+
+function uploadTexture(now){
+  // ---- 首选：Worker 解好的 ImageBitmap，主线程一次解码都不做 ----
+  if (bmp){
+    const b = bmp; bmp = null;
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    if (texW !== b.width || texH !== b.height){
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, b);
+      texW = b.width; texH = b.height;
+      document.getElementById('vRes').textContent = b.width + '×' + b.height + '  (2:1)';
+    } else {
+      gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, gl.RGBA, gl.UNSIGNED_BYTE, b);
+    }
+    if (showMap) mbCtx.drawImage(b, 0, 0, mapBase.width, mapBase.height);
+    b.close();
+    shownFrames++;                 // 真正送上屏的帧数
+    hasFrame = true;
+    return true;
+  }
+
+  // ---- 回退：老 <img> 路径（Worker 不可用时）----
+  if (!img.complete || !img.naturalWidth) return false;
+  const limit = loadSeen === 0 ? UPLOAD_FALLBACK_MS : 500;
+  if (!(dirty || now - lastUpload >= limit)) return false;
+  dirty = false; lastUpload = now;
+
+  const w = img.naturalWidth, h = img.naturalHeight;
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  if (texW !== w || texH !== h){
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
+    texW = w; texH = h;
+    document.getElementById('vRes').textContent = w + '×' + h + '  (2:1)';
+  } else {
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, gl.RGBA, gl.UNSIGNED_BYTE, img);
+  }
+  if (showMap) mbCtx.drawImage(img, 0, 0, mapBase.width, mapBase.height);
+  shownFrames++;
+  hasFrame = true;
+  return true;
+}
+
+let lastView = {yaw: NaN, pitch: NaN, fov: NaN};
+function drawMap(force){
+  const wrapEl = document.getElementById('mapWrap');
+  if (!showMap){ wrapEl.style.display = 'none'; return; }
+  wrapEl.style.display = '';
+  if (!hasFrame) return;
+
+  // 画面和视角都没变就不用重画
+  const changed = lastView.yaw !== yaw || lastView.pitch !== pitch
+               || lastView.fov !== fov;
+  if (!force && !changed) return;
+  lastView = {yaw, pitch, fov};
+
+  mapCtx.drawImage(mapBase, 0, 0);
+
+  // 用和 shader 完全相同的公式算出当前朝向，画一个视锥框
+  const f = 1.0 / Math.tan(fov/2);
+  const aspect = canvas.width / canvas.height;
+  let d = [0, 0, -1];
+  let cp = Math.cos(pitch), sp = Math.sin(pitch);
+  d = [d[0], cp*d[1] - sp*d[2], sp*d[1] + cp*d[2]];
+  let cy = Math.cos(yaw), sy = Math.sin(yaw);
+  d = [cy*d[0] + sy*d[2], d[1], -sy*d[0] + cy*d[2]];
+  const lon = Math.atan2(d[0], -d[2]);
+  const lat = Math.asin(Math.max(-1, Math.min(1, d[1])));
+  const u = lon / (2*Math.PI) + 0.5, v = 0.5 - lat / Math.PI;
+
+  const halfW = Math.atan(Math.tan(fov/2) * aspect) / (2*Math.PI);
+  const halfH = (fov/2) / Math.PI;
+
+  const x = u * mapCv.width, y = v * mapCv.height;
+  mapCtx.save();
+  mapCtx.strokeStyle = '#4ade80'; mapCtx.lineWidth = 2.5;
+  mapCtx.strokeRect(x - halfW*mapCv.width, y - halfH*mapCv.height,
+                    halfW*2*mapCv.width, halfH*2*mapCv.height);
+  mapCtx.beginPath(); mapCtx.arc(x, y, 3.5, 0, Math.PI*2);
+  mapCtx.fillStyle = '#4ade80'; mapCtx.fill();
+  mapCtx.restore();
+}
+
+function frame(now){
+  resize();
+  // 纹理上传和渲染解耦：画面按源码率更新，视角按屏幕刷新率更新。
+  // 拖动时转视角是纯数学（改 uniform），所以即使画面还是上一帧，
+  // 视角也是 120Hz 跟手的。
+  const gotNew = uploadTexture(now);
+
+  gl.viewport(0, 0, canvas.width, canvas.height);
+  gl.useProgram(prog);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.uniform2f(uRes, canvas.width, canvas.height);
+  gl.uniform1f(uYaw, yaw);
+  gl.uniform1f(uPitch, pitch);
+  gl.uniform1f(uFov, fov);
+  gl.uniform1f(uRaw, showRaw ? 1 : 0);
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+  drawMap(gotNew);
+  measureShown(now);
+
+  frames++;
+  if (now - lastFpsT >= 1000){
+    const dt = (now - lastFpsT) / 1000;
+    fps = frames / dt;
+    frames = 0; lastFpsT = now;
+    document.getElementById('vFps').textContent = fps.toFixed(0) + ' fps';
+    document.getElementById('vFov').textContent = (fov*180/Math.PI).toFixed(0) + '°';
+    document.getElementById('vYaw').textContent =
+      ((yaw*180/Math.PI + 540) % 360 - 180).toFixed(0) + '° / ' +
+      (pitch*180/Math.PI).toFixed(0) + '°';
+  }
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+// ---- 真实显示帧率 ----
+// 直接数「每秒真正上传到纹理的帧数」。这就是你眼睛看到的帧率。
+// （原来用 64x32 像素比对去猜，结果那个 drawImage 每个 rAF 都在逼浏览器
+//   同步解码一次大图，反而把帧率压得更低 —— 已经去掉。）
+let shownFrames = 0, lastShownT = performance.now(), shownFps = 0;
+
+function measureShown(now){
+  if (now - lastShownT >= 1000){
+    shownFps = shownFrames * 1000 / (now - lastShownT);
+    shownFrames = 0; lastShownT = now;
+    document.getElementById('vVid').textContent =
+      shownFps.toFixed(1) + ' fps' + (gotAnyBmp ? '' : '（回退模式）');
+    // 回传给服务端：这样从 /status 就能读到「用户屏幕上真实的帧率」
+    fetch('/report?shown=' + shownFps.toFixed(2) + '&res=' + texW + 'x' + texH,
+          { cache: 'no-store' }).catch(() => {});
+  }
+}
+
+// 调试钩子：出问题时可以直接在控制台/自动化里问它一句
+window.__dbg = () => ({
+  workerAlive, gotAnyBmp, bmpCount, shownFrames,
+  shownFps: +shownFps.toFixed(1), texW, texH, lastErr,
+  visible: document.visibilityState,
+});
+</script>
+</body>
+</html>
